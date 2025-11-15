@@ -1,0 +1,100 @@
+加载图: graph/amazon_sym.txt
+原始图节点=334863 边=1851744
+初始社区数=381
+自动新增节点 10%，随机边度=3，seed=123456789
+新图节点=368349 边=2048219 (新增节点=33486)
+最终新增节点数量=33486
+分配 DPU 数=16
+Shard local alloc=2752784 bytes (2.63 MiB); globalSection=1.41 MiB
+Shard local alloc=2143224 bytes (2.04 MiB); globalSection=1.41 MiB
+Shard local alloc=2273784 bytes (2.17 MiB); globalSection=1.41 MiB
+Shard local alloc=2140168 bytes (2.04 MiB); globalSection=1.41 MiB
+Shard local alloc=2405192 bytes (2.29 MiB); globalSection=1.41 MiB
+Shard local alloc=2265720 bytes (2.16 MiB); globalSection=1.41 MiB
+Shard local alloc=2181448 bytes (2.08 MiB); globalSection=1.41 MiB
+Shard local alloc=2244872 bytes (2.14 MiB); globalSection=1.41 MiB
+Shard local alloc=2235480 bytes (2.13 MiB); globalSection=1.41 MiB
+Shard local alloc=2253976 bytes (2.15 MiB); globalSection=1.41 MiB
+Shard local alloc=2298440 bytes (2.19 MiB); globalSection=1.41 MiB
+Shard local alloc=2199344 bytes (2.10 MiB); globalSection=1.41 MiB
+Shard local alloc=2219664 bytes (2.12 MiB); globalSection=1.41 MiB
+Shard local alloc=2250008 bytes (2.15 MiB); globalSection=1.41 MiB
+Shard local alloc=2197664 bytes (2.10 MiB); globalSection=1.41 MiB
+Shard local alloc=2246616 bytes (2.14 MiB); globalSection=1.41 MiB
+=== DPU#0x30190000 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=33784 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190001 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=18589 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190100 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=21899 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190101 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=18663 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190200 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=26187 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190201 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22464 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190300 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=20775 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190301 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22589 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190400 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22294 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190401 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=23234 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190500 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=24749 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190501 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22133 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190600 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22629 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190601 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=23433 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190700 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22057 numComm=381
+DPU Local Moving done. movelocal = 1
+=== DPU#0x30190701 ===
+DPU 0: params_m = 1048576
+twoM=4096438 numLocal=22870 numComm=381
+DPU Local Moving done. movelocal = 1
+[Original] LocalMove iter=0 moved=true
+[Original] Refinement connected=false
+Shard local alloc=2749088 bytes (2.62 MiB); globalSection=1.43 MiB
+Shard local alloc=2157224 bytes (2.06 MiB); globalSection=1.43 MiB
+Shard local alloc=2284144 bytes (2.18 MiB); globalSection=1.43 MiB
+Shard local alloc=2342272 bytes (2.23 MiB); globalSection=1.43 MiB
+Shard local alloc=2225280 bytes (2.12 MiB); globalSection=1.43 MiB
+Shard local alloc=2416912 bytes (2.30 MiB); globalSection=1.43 MiB
+Shard local alloc=2185632 bytes (2.08 MiB); globalSection=1.43 MiB
+Shard local alloc=2354608 bytes (2.25 MiB); globalSection=1.43 MiB
+Shard local alloc=2216064 bytes (2.11 MiB); globalSection=1.43 MiB
+Shard local alloc=2326696 bytes (2.22 MiB); globalSection=1.43 MiB
+Shard local all

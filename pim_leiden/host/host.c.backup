@@ -1,0 +1,1117 @@
+/**
+ * Incremental Leiden 主流程 (纯 C 版本)
+ *
+ * 功能概述：
+ *   1. 支持增量新增节点 (--auto-new + --new-degree=K + --seed=SEED)
+ *   2. 支持从文件读取新增节点集合（new_nodes_file 或 '-' 表示无）
+ *   3. 构建活跃集合（新增节点 + 一跳或二跳邻居 --twohop）
+ *   4. 原始层：Local Moving + Refinement（若出现非连通社区，均匀拆分并重建分片循环继续）
+ *   5. 聚合层（可选 --no-aggregate 关闭）：构建社区超图再做一轮 Local Moving + Refinement
+ *   6. 计时：CPU 计算、DPU kernel、数据传输（CPU->DPU / DPU->CPU）、聚合构建
+ *
+ * 注意与后续改进点：
+ *   - simplified_gain 非标准模块度增益，需要后续替换为标准 ΔQ。
+ *   - Refinement 仅统计连通分量个数并“均匀拆分”，未使用真实标签 perNodeComponentIndex。
+ *   - 每分片仍复制整张 nodeCommunity 数组（高内存占用）。可改为邻居社区预展开以减少 MRAM。
+ *   - 活跃集合目前仅用于位图筛选，Σ_tot 仍全量重算。
+ *   - MRAM 分配前进行内存占用预估，超过 64MiB 直接报错退出。
+ */
+
+#include <dpu.h>
+#include <dpu_log.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <inttypes.h>
+
+#include "graph_loader.h"
+#include "common.h"
+#include "aggregation.h"
+#include "membership_io.h"
+#include "mram-management.h"
+
+/* -------------------- 全局传输计时变量（mram-management.h 中 extern） -------------------- */
+double g_cpu_to_dpu_time = 0.0;
+double g_dpu_to_cpu_time = 0.0;
+
+/* -------------------- 辅助：当前墙钟时间（秒） -------------------- */
+static inline double wall_time_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* -------------------- 简易随机数：xorshift64 -------------------- */
+static uint64_t xs_state = 88172645463393265ULL;
+static inline void xs_seed(uint64_t s) { xs_state = (s ? s : 88172645463393265ULL); }
+static inline uint64_t xs_next() {
+    uint64_t x = xs_state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    xs_state = x;
+    return x;
+}
+
+/* =========================================================================================
+ * 读取新增节点列表（文本文件，一行一个 ID；遇到 '#' 或空行忽略）
+ * ========================================================================================= */
+static void load_new_nodes_file(const char *path, uint32_t maxNode, uint32_t **out_ids, uint32_t *out_count) {
+    *out_ids = NULL;
+    *out_count = 0;
+    if (strcmp(path, "-") == 0) {
+        return; /* 不使用文件列表 */
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        perror("无法打开新增节点文件");
+        return;
+    }
+    char buf[256];
+    uint32_t cap = 128;
+    uint32_t *ids = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    if (!ids) { fclose(fp); return; }
+    uint32_t cnt = 0;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (buf[0] == '#' || buf[0] == '\n' || buf[0] == '\0') continue;
+        uint32_t id = 0;
+        if (sscanf(buf, "%u", &id) == 1) {
+            if (id < maxNode) {
+                if (cnt == cap) {
+                    cap *= 2;
+                    uint32_t *tmp = (uint32_t*)realloc(ids, cap * sizeof(uint32_t));
+                    if (!tmp) { free(ids); fclose(fp); return; }
+                    ids = tmp;
+                }
+                ids[cnt++] = id;
+            }
+        }
+    }
+    fclose(fp);
+    *out_ids = ids;
+    *out_count = cnt;
+}
+
+/* =========================================================================================
+ * 在原图上增量增加 10% 新节点并为其随机生成 new_degree 条无向边
+ * ========================================================================================= */
+static void add_random_nodes_and_edges(graph_t *g,
+                                       uint32_t original_n,
+                                       uint32_t new_degree,
+                                       uint64_t seed,
+                                       uint32_t **out_new_nodes,
+                                       uint32_t *out_new_count) {
+    uint32_t extra = (uint32_t)(original_n * 0.10); /* 10% */
+    if (extra == 0) {
+        *out_new_nodes = NULL;
+        *out_new_count = 0;
+        return;
+    }
+    uint32_t oldN = g->n_nodes;
+    uint32_t newN = oldN + extra;
+    xs_seed(seed);
+
+    uint32_t **adj = (uint32_t**)calloc(newN, sizeof(uint32_t*));
+    uint32_t *adjCap = (uint32_t*)calloc(newN, sizeof(uint32_t));
+    uint32_t *adjCnt = (uint32_t*)calloc(newN, sizeof(uint32_t));
+    if (!adj || !adjCap || !adjCnt) {
+        free(adj); free(adjCap); free(adjCnt);
+        *out_new_nodes = NULL; *out_new_count = 0;
+        return;
+    }
+
+    /* 复制旧邻接 */
+    for (uint32_t u = 0; u < oldN; ++u) {
+        uint32_t s = g->row_ptr[u];
+        uint32_t e = g->row_ptr[u + 1];
+        uint32_t deg = e - s;
+        adjCap[u] = (deg + new_degree) ? (deg + new_degree) : 1;
+        adj[u] = (uint32_t*)malloc(adjCap[u] * sizeof(uint32_t));
+        if (!adj[u]) {
+            for (uint32_t x=0;x<u;++x) free(adj[x]);
+            free(adj); free(adjCap); free(adjCnt);
+            *out_new_nodes = NULL; *out_new_count = 0;
+            return;
+        }
+        memcpy(adj[u], &g->col_idx[s], deg * sizeof(uint32_t));
+        adjCnt[u] = deg;
+    }
+
+    /* 新节点列表 */
+    uint32_t *newNodes = (uint32_t*)malloc(extra * sizeof(uint32_t));
+    if (!newNodes) {
+        for (uint32_t x=0;x<oldN;++x) free(adj[x]);
+        free(adj); free(adjCap); free(adjCnt);
+        *out_new_nodes = NULL; *out_new_count = 0;
+        return;
+    }
+    for (uint32_t i=0; i<extra; ++i) newNodes[i] = oldN + i;
+    *out_new_nodes = newNodes;
+    *out_new_count = extra;
+
+    /* 随机边 */
+    for (uint32_t ni = 0; ni < extra; ++ni) {
+        uint32_t u = newNodes[ni];
+        adjCap[u] = new_degree ? new_degree : 1;
+        adj[u] = (uint32_t*)malloc(adjCap[u] * sizeof(uint32_t));
+        if (!adj[u]) continue;
+        adjCnt[u] = 0;
+        for (uint32_t k=0; k<new_degree; ++k) {
+            uint32_t v = (uint32_t)(xs_next() % newN);
+            if (v == u) { --k; continue; }
+            if (adjCnt[u] == adjCap[u]) {
+                adjCap[u] *= 2;
+                uint32_t *tmp = (uint32_t*)realloc(adj[u], adjCap[u] * sizeof(uint32_t));
+                if (!tmp) break;
+                adj[u] = tmp;
+            }
+            adj[u][adjCnt[u]++] = v;
+            if (adjCnt[v] == adjCap[v]) {
+                adjCap[v] = adjCap[v] ? (adjCap[v] * 2) : 2;
+                uint32_t *tmp2 = (uint32_t*)realloc(adj[v], adjCap[v] * sizeof(uint32_t));
+                if (!tmp2) continue;
+                adj[v] = tmp2;
+            }
+            adj[v][adjCnt[v]++] = u;
+        }
+    }
+
+    /* 去重排序 */
+    uint64_t totalEdges = 0;
+    for (uint32_t u=0; u<newN; ++u) {
+        if (adjCnt[u] == 0) continue;
+        int cmp_u32(const void *a, const void *b) {
+            uint32_t aa = *(const uint32_t*)a;
+            uint32_t bb = *(const uint32_t*)b;
+            return (aa > bb) - (aa < bb);
+        }
+        qsort(adj[u], adjCnt[u], sizeof(uint32_t), cmp_u32);
+        uint32_t w = 0;
+        for (uint32_t r=0; r<adjCnt[u]; ++r)
+            if (r == 0 || adj[u][r] != adj[u][r-1]) adj[u][w++] = adj[u][r];
+        adjCnt[u] = w;
+        totalEdges += w;
+    }
+
+    /* 新 CSR */
+    uint32_t *new_row_ptr = (uint32_t*)malloc((newN + 1) * sizeof(uint32_t));
+    uint32_t *new_col_idx = (uint32_t*)malloc(totalEdges * sizeof(uint32_t));
+    if (!new_row_ptr || !new_col_idx) {
+        free(new_row_ptr); free(new_col_idx);
+        for (uint32_t u=0;u<newN;++u) free(adj[u]);
+        free(adj); free(adjCap); free(adjCnt);
+        return;
+    }
+    uint64_t prefix = 0;
+    for (uint32_t u=0; u<newN; ++u) {
+        new_row_ptr[u] = (uint32_t)prefix;
+        prefix += adjCnt[u];
+    }
+    new_row_ptr[newN] = (uint32_t)prefix;
+    uint64_t cursor = 0;
+    for (uint32_t u=0; u<newN; ++u) {
+        if (adjCnt[u] > 0) {
+            memcpy(&new_col_idx[cursor], adj[u], adjCnt[u] * sizeof(uint32_t));
+            cursor += adjCnt[u];
+        }
+    }
+
+    free(g->row_ptr);
+    free(g->col_idx);
+    g->row_ptr = new_row_ptr;
+    g->col_idx = new_col_idx;
+    g->n_nodes = newN;
+    g->n_edges = (uint32_t)totalEdges;
+
+    for (uint32_t u=0;u<newN;++u) free(adj[u]);
+    free(adj); free(adjCap); free(adjCnt);
+}
+
+/* =========================================================================================
+ * Σ_tot 计算
+ * ========================================================================================= */
+static void computeSumTot(const graph_t *g, const uint32_t *membership, uint32_t numCommunities, uint64_t *sumTot) {
+    memset(sumTot, 0, sizeof(uint64_t) * numCommunities);
+    for (uint32_t v=0; v<g->n_nodes; ++v) {
+        uint32_t c = membership[v];
+        if (c < numCommunities)
+            sumTot[c] += (uint64_t)(g->row_ptr[v+1] - g->row_ptr[v]);
+    }
+}
+
+static int allConnected(const uint32_t *compCount, uint32_t numCommunities) {
+    for (uint32_t c=0; c<numCommunities; ++c)
+        if (compCount[c] != 1) return 0;
+    return 1;
+}
+
+/* 均匀拆分（简化） */
+static void applyRefinementNaive(const graph_t *g,
+                                 uint32_t *membership,
+                                 uint32_t *pNumCommunities,
+                                 const uint32_t *compCount) {
+    uint32_t numCommunities = *pNumCommunities;
+    uint32_t original = numCommunities;
+    for (uint32_t c=0; c<original; ++c) {
+        uint32_t parts = compCount[c];
+        if (parts <= 1) continue;
+        uint32_t countNodes = 0;
+        for (uint32_t v=0; v<g->n_nodes; ++v)
+            if (membership[v] == c) countNodes++;
+        if (countNodes < parts || countNodes == 0) continue;
+
+        uint32_t *nodes = (uint32_t*)malloc(countNodes * sizeof(uint32_t));
+        if (!nodes) continue;
+        uint32_t pos=0;
+        for (uint32_t v=0; v<g->n_nodes; ++v)
+            if (membership[v] == c) nodes[pos++] = v;
+
+        uint32_t base = countNodes / parts;
+        uint32_t rem  = countNodes % parts;
+        uint32_t cursor = 0;
+        for (uint32_t p=0; p<parts; ++p) {
+            uint32_t take = base + (p < rem ? 1u : 0u);
+            uint32_t newC = (p == 0) ? c : (numCommunities++);
+            for (uint32_t k=0; k<take; ++k) {
+                membership[nodes[cursor++]] = newC;
+            }
+        }
+        free(nodes);
+    }
+    *pNumCommunities = numCommunities;
+}
+
+/* =========================================================================================
+ * 分片结构与构建
+ * ========================================================================================= */
+struct Shard {
+    uint32_t commStart, commCount;
+    uint32_t *localNodes;
+    uint32_t  localNodeCount;
+    uint32_t *localNodePtr;
+    uint32_t *localNbr;
+    uint32_t  localNbrCount;
+    uint64_t *activeBitmap;
+
+    uint32_t movedFlag_m;
+    uint32_t params_m;
+    uint32_t perCommunityComponentCount_m;
+
+    struct LeidenParams P;
+};
+
+static void buildShards(const graph_t *g,
+                        uint32_t *membership,
+                        uint32_t numCommunities,
+                        uint32_t numDpus,
+                        struct Shard *shards,
+                        int verbosity) {
+    uint32_t *commCounts = (uint32_t*)calloc(numCommunities, sizeof(uint32_t));
+    for (uint32_t v=0; v<g->n_nodes; ++v) {
+        uint32_t c = membership[v];
+        if (c < numCommunities) commCounts[c]++;
+    }
+    double target = (double)g->n_nodes / (double)numDpus;
+    uint64_t acc = 0;
+    uint32_t cur = 0;
+    uint32_t sid = 0;
+    for (uint32_t c=0; c<numCommunities; ++c) {
+        if ((sid+1) < numDpus && acc >= (uint64_t)((sid+1)*target)) {
+            shards[sid].commStart = cur;
+            shards[sid].commCount = c - cur;
+            sid++;
+            cur = c;
+        }
+        acc += commCounts[c];
+    }
+    shards[sid].commStart = cur;
+    shards[sid].commCount = numCommunities - cur;
+
+    uint32_t *counts = (uint32_t*)calloc(numDpus, sizeof(uint32_t));
+    for (uint32_t v=0; v<g->n_nodes; ++v) {
+        uint32_t c = membership[v];
+        for (uint32_t s=0; s<numDpus; ++s) {
+            uint32_t st = shards[s].commStart;
+            uint32_t ed = st + shards[s].commCount;
+            if (c >= st && c < ed) { counts[s]++; break; }
+        }
+    }
+    for (uint32_t s=0; s<numDpus; ++s) {
+        shards[s].localNodes = (uint32_t*)malloc(counts[s]*sizeof(uint32_t));
+        shards[s].localNodeCount = counts[s];
+        counts[s] = 0;
+    }
+    for (uint32_t v=0; v<g->n_nodes; ++v) {
+        uint32_t c = membership[v];
+        for (uint32_t s=0; s<numDpus; ++s) {
+            uint32_t st = shards[s].commStart;
+            uint32_t ed = st + shards[s].commCount;
+            if (c >= st && c < ed) {
+                shards[s].localNodes[counts[s]++] = v;
+                break;
+            }
+        }
+    }
+    for (uint32_t s=0; s<numDpus; ++s) {
+        struct Shard *sh = &shards[s];
+        uint64_t total = 0;
+        sh->localNodePtr = (uint32_t*)malloc((sh->localNodeCount+1)*sizeof(uint32_t));
+        for (uint32_t i=0; i<sh->localNodeCount; ++i) {
+            uint32_t gv = sh->localNodes[i];
+            uint32_t deg = g->row_ptr[gv+1] - g->row_ptr[gv];
+            sh->localNodePtr[i] = (uint32_t)total;
+            total += deg;
+        }
+        sh->localNodePtr[sh->localNodeCount] = (uint32_t)total;
+        sh->localNbrCount = (uint32_t)total;
+        sh->localNbr = (uint32_t*)malloc(sh->localNbrCount*sizeof(uint32_t));
+        for (uint32_t i=0; i<sh->localNodeCount; ++i) {
+            uint32_t gv = sh->localNodes[i];
+            uint32_t s0 = g->row_ptr[gv];
+            uint32_t e0 = g->row_ptr[gv+1];
+            uint32_t base = sh->localNodePtr[i];
+            memcpy(&sh->localNbr[base], &g->col_idx[s0], (e0-s0)*sizeof(uint32_t));
+        }
+        size_t words = (sh->localNodeCount + 63) / 64;
+        sh->activeBitmap = (uint64_t*)calloc(words, sizeof(uint64_t));
+        for (uint32_t i=0; i<sh->localNodeCount; ++i)
+            sh->activeBitmap[i >> 6] |= (1ULL << (i & 63));
+        if (verbosity >= 2) {
+            printf("Shard %u: comm=[%u,%u) nodes=%u edges=%u\n",
+                   s, sh->commStart, sh->commStart + sh->commCount,
+                   sh->localNodeCount, sh->localNbrCount);
+        }
+    }
+
+    free(commCounts);
+    free(counts);
+}
+
+static void applyActiveToShards(const char *activeGlobal,
+                                struct Shard *shards,
+                                uint32_t numDpus) {
+    for (uint32_t s=0; s<numDpus; ++s) {
+        struct Shard *sh = &shards[s];
+        size_t words = (sh->localNodeCount + 63) / 64;
+        memset(sh->activeBitmap, 0, words * sizeof(uint64_t));
+        for (uint32_t i=0; i<sh->localNodeCount; ++i) {
+            uint32_t gv = sh->localNodes[i];
+            if (activeGlobal[gv])
+                sh->activeBitmap[i >> 6] |= (1ULL << (i & 63));
+        }
+    }
+}
+
+/* =========================================================================================
+ * MRAM 预估与安全下发（所有 size/offset 8B 对齐）
+ * ========================================================================================= */
+static uint64_t estimateShardMramUsage(uint32_t globalN,
+                                       uint32_t globalC,
+                                       uint32_t localNodeCount,
+                                       uint32_t localNbrCount) {
+    uint64_t total = 0;
+    total += ROUND_UP_TO_MULTIPLE_OF_8(8); /* movedFlag 8B */
+    total += ROUND_UP_TO_MULTIPLE_OF_8(localNodeCount*sizeof(uint32_t));
+    total += ROUND_UP_TO_MULTIPLE_OF_8((localNodeCount+1)*sizeof(uint32_t));
+    total += ROUND_UP_TO_MULTIPLE_OF_8(localNbrCount*sizeof(uint32_t));
+    uint64_t words = (localNodeCount + 63) / 64;
+    total += ROUND_UP_TO_MULTIPLE_OF_8(words*sizeof(uint64_t));
+    total += ROUND_UP_TO_MULTIPLE_OF_8(globalN*sizeof(uint32_t));
+    total += ROUND_UP_TO_MULTIPLE_OF_8(globalC*sizeof(uint64_t));
+    uint32_t paddedC = (globalC % 2 == 0) ? globalC : (globalC + 1);
+    total += ROUND_UP_TO_MULTIPLE_OF_8(paddedC*sizeof(uint32_t));
+    uint32_t paddedLocal = (localNodeCount % 2 == 0) ? localNodeCount : (localNodeCount + 1);
+    total += ROUND_UP_TO_MULTIPLE_OF_8(paddedLocal*sizeof(uint32_t));
+    total += ROUND_UP_TO_MULTIPLE_OF_8(sizeof(struct LeidenParams));
+    return total;
+}
+/* ---- 共享段偏移管理 ---- */
+#define GLOBAL_SECTION_BASE ROUND_UP_TO_MULTIPLE_OF_8(sizeof(struct LeidenParams))
+static uint32_t g_nodeCommunity_offset = 0;
+static uint32_t g_commTotDeg_offset = 0;
+static uint32_t g_globalSectionEnd = 0;
+
+/* 广播初始化：membership + Σ_tot */
+static void GlobalBroadcast(struct dpu_set_t dpu_set,
+                                uint32_t N,
+                                uint32_t C,
+                                const uint32_t *membership,
+                                const uint64_t *sumTot) {
+    g_nodeCommunity_offset = GLOBAL_SECTION_BASE;
+    uint32_t membership_bytes = N * sizeof(uint32_t);
+    g_commTotDeg_offset = g_nodeCommunity_offset + ROUND_UP_TO_MULTIPLE_OF_8(membership_bytes);
+    uint32_t commTot_bytes = C * sizeof(uint64_t);
+    g_globalSectionEnd = g_commTotDeg_offset + ROUND_UP_TO_MULTIPLE_OF_8(commTot_bytes);
+
+    /* 广播两块 */
+    broadcastToAllDPUs(dpu_set, (const uint8_t*)membership,
+                       g_nodeCommunity_offset, membership_bytes);
+    broadcastToAllDPUs(dpu_set, (const uint8_t*)sumTot,
+                       g_commTotDeg_offset, commTot_bytes);
+}
+
+/* 局部分片 push：不再复制 membership/Σ_tot，只写局部数据与参数结构 */
+static void pushShardBroadcast(struct dpu_set_t dpu,
+                               struct Shard *sh,
+                               uint32_t N,
+                               uint32_t C,
+                               uint64_t twoM) {
+
+    struct mram_heap_allocator_t alloc;
+    init_allocator(&alloc);
+    /* 启动分配器时跳过共享段空间 */
+    alloc.totalAllocated = g_globalSectionEnd;
+
+    sh->movedFlag_m = mram_heap_alloc(&alloc, 4);
+
+    uint32_t localNodeList_m=0, localNodePtr_m=0, localNbr_m=0, active_m=0;
+    if (sh->localNodeCount > 0) {
+        localNodeList_m = mram_heap_alloc(&alloc, sh->localNodeCount*sizeof(uint32_t));
+        localNodePtr_m  = mram_heap_alloc(&alloc, (sh->localNodeCount+1)*sizeof(uint32_t));
+        localNbr_m      = mram_heap_alloc(&alloc, sh->localNbrCount*sizeof(uint32_t));
+        size_t words    = (sh->localNodeCount + 63)/64;
+        active_m        = mram_heap_alloc(&alloc, words*sizeof(uint64_t));
+    }
+
+    uint32_t perCommunityComponentCount_m = mram_heap_alloc(&alloc, C*sizeof(uint32_t));
+    uint32_t perNodeComponentIndex_m      = (sh->localNodeCount>0)?
+                                            mram_heap_alloc(&alloc, sh->localNodeCount*sizeof(uint32_t)) : 0;
+
+    sh->params_m = 0; /* 参数结构位置固定为 0 */
+
+    memset(&sh->P, 0, sizeof(sh->P));
+    sh->P.numGlobalNodes             = N;
+    sh->P.numLocalNodes              = sh->localNodeCount;
+    sh->P.numCommunities             = C;
+    sh->P.phase                      = PHASE_LOCAL_MOVE;
+    sh->P.movedFlag_m                = sh->movedFlag_m;
+    sh->P.localNodeList_m            = localNodeList_m;
+    sh->P.localNodePtr_m             = localNodePtr_m;
+    sh->P.localNeighborIdxs_m        = localNbr_m;
+    sh->P.nodeCommunity_m            = g_nodeCommunity_offset;
+    sh->P.communityTotalDegree_m     = g_commTotDeg_offset;
+    sh->P.activeNodes_m              = active_m;
+    sh->P.perCommunityComponentCount_m = perCommunityComponentCount_m;
+    sh->P.perNodeComponentIndex_m    = perNodeComponentIndex_m;
+    sh->P.managedCommStart           = sh->commStart;
+    sh->P.managedCommCount           = sh->commCount;
+    sh->P.twoM                       = twoM;
+
+    /* 下发局部块 */
+    uint32_t zero = 0;
+    copyToDPU(dpu, (const uint8_t*)&zero, sh->movedFlag_m, 4);
+    if (sh->localNodeCount > 0) {
+        copyToDPU(dpu, (const uint8_t*)sh->localNodes, localNodeList_m,
+                  sh->localNodeCount*sizeof(uint32_t));
+        copyToDPU(dpu, (const uint8_t*)sh->localNodePtr, localNodePtr_m,
+                  (sh->localNodeCount+1)*sizeof(uint32_t));
+        copyToDPU(dpu, (const uint8_t*)sh->localNbr, localNbr_m,
+                  sh->localNbrCount*sizeof(uint32_t));
+        size_t words = (sh->localNodeCount + 63)/64;
+        copyToDPU(dpu, (const uint8_t*)sh->activeBitmap, active_m,
+                  words*sizeof(uint64_t));
+
+        if (perNodeComponentIndex_m) {
+            uint32_t invalid = 0xFFFFFFFFu;
+            for (uint32_t i=0; i<sh->localNodeCount; ++i) {
+                copyToDPU(dpu, (const uint8_t*)&invalid,
+                          perNodeComponentIndex_m + i*sizeof(uint32_t),
+                          sizeof(uint32_t));
+            }
+        }
+    }
+    /* perCommunityComponentCount 初始化为 1 */
+    for (uint32_t c=0; c<C; ++c) {
+        uint32_t one = 1;
+        copyToDPU(dpu, (const uint8_t*)&one,
+                  perCommunityComponentCount_m + c*sizeof(uint32_t),
+                  sizeof(uint32_t));
+    }
+
+    /* 参数结构写到偏移 0 */
+    copyToDPU(dpu, (const uint8_t*)&sh->P, sh->params_m, sizeof(struct LeidenParams));
+
+    sh->perCommunityComponentCount_m = perCommunityComponentCount_m;
+
+    printf("Shard local alloc=%u bytes (%.2f MiB); globalSection=%.2f MiB\n",
+           alloc.totalAllocated,
+           alloc.totalAllocated/(1024.0*1024.0),
+           g_globalSectionEnd/(1024.0*1024.0));
+}
+
+static void updateLocalMove(struct dpu_set_t dpu,
+                            struct Shard *sh,
+                            const uint32_t *membership,
+                            const uint64_t *sumTot,
+                            uint32_t iter,
+                            uint32_t maxIter,
+                            uint64_t twoM) {
+    uint32_t N = sh->P.numGlobalNodes;
+    uint32_t paddedN = (N % 2 == 0) ? N : (N + 1);
+    copyToDPU(dpu, (uint8_t*)membership, sh->P.nodeCommunity_m,
+              ROUND_UP_TO_MULTIPLE_OF_8(paddedN*sizeof(uint32_t)));
+    copyToDPU(dpu, (uint8_t*)sumTot, sh->P.communityTotalDegree_m,
+              ROUND_UP_TO_MULTIPLE_OF_8(sh->P.numCommunities*sizeof(uint64_t)));
+    uint64_t moved64 = 0;
+    copyToDPU(dpu, (uint8_t*)&moved64, sh->movedFlag_m, 8);
+    sh->P.phase = PHASE_LOCAL_MOVE;
+    sh->P.iteration = iter;
+    sh->P.maxIterations = maxIter;
+    sh->P.twoM = twoM;
+    //printf("twoM=%" PRIu64 "\n", twoM);
+    copyToDPU(dpu, (uint8_t*)&sh->P, sh->params_m,
+              ROUND_UP_TO_MULTIPLE_OF_8(sizeof(struct LeidenParams)));
+}
+
+static void startRefinement(struct dpu_set_t dpu, struct Shard *sh, uint32_t maxRefineIters) {
+    sh->P.phase = PHASE_REFINEMENT;
+    sh->P.maxIterations = maxRefineIters;
+    copyToDPU(dpu, (uint8_t*)&sh->P, sh->params_m,
+              ROUND_UP_TO_MULTIPLE_OF_8(sizeof(struct LeidenParams)));
+}
+
+static int pullMovedAndMembership(struct dpu_set_t dpu, struct Shard *sh, uint32_t *membership) {
+    uint64_t moved64 = 0;
+    copyFromDPU(dpu, sh->movedFlag_m, (uint8_t*)&moved64, 8);
+    if ((uint32_t)moved64) {
+        uint32_t N = sh->P.numGlobalNodes;
+        uint32_t paddedN = (N % 2 == 0) ? N : (N + 1);
+        uint32_t *tmp = (uint32_t*)malloc(paddedN*sizeof(uint32_t));
+        copyFromDPU(dpu, sh->P.nodeCommunity_m, (uint8_t*)tmp,
+                    ROUND_UP_TO_MULTIPLE_OF_8(paddedN*sizeof(uint32_t)));
+        memcpy(membership, tmp, N*sizeof(uint32_t));
+        free(tmp);
+        return 1;
+    }
+    return 0;
+}
+
+static void pullRefinementCounts(struct dpu_set_t dpu, struct Shard *sh, uint32_t *counts) {
+    uint32_t C = sh->P.numCommunities;
+    uint32_t paddedC = (C % 2 == 0) ? C : (C + 1);
+    uint32_t *tmp = (uint32_t*)malloc(paddedC*sizeof(uint32_t));
+    copyFromDPU(dpu, sh->perCommunityComponentCount_m, (uint8_t*)tmp,
+                ROUND_UP_TO_MULTIPLE_OF_8(paddedC*sizeof(uint32_t)));
+    memcpy(counts, tmp, C*sizeof(uint32_t)); 
+    free(tmp);
+}
+
+/* =========================================================================================
+ * 原始层迭代
+ * ========================================================================================= */
+static void runOriginalIncrementalLayer(struct dpu_set_t dpu_set,
+                                        struct Shard *shards,
+                                        uint32_t numDpus,
+                                        graph_t *g,
+                                        uint32_t *membership,
+                                        uint32_t *pNumCommunities,
+                                        uint64_t twoM,
+                                        uint32_t maxLocalIters,
+                                        uint32_t maxRefineIters,
+                                        const char *activeGlobal,
+                                        double *cpuTime,
+                                        double *dpuTime) {
+
+    (void)activeGlobal;
+    struct dpu_set_t dpu; /* 用于 DPU_FOREACH */
+
+    uint32_t numCommunities = *pNumCommunities;
+    uint64_t *sumTot = (uint64_t*)malloc(numCommunities * sizeof(uint64_t));
+    if (!sumTot) return;
+
+    int needRepeat = 1;
+    while (needRepeat) {
+        int iter = 0;
+        int movedAny = 1;
+        while (movedAny && (maxLocalIters == 0 || iter < (int)maxLocalIters)) {
+            movedAny = 0;
+            double t0 = wall_time_now();
+            computeSumTot(g, membership, numCommunities, sumTot);
+            uint32_t si = 0;
+            DPU_FOREACH(dpu_set, dpu) {
+                updateLocalMove(dpu, &shards[si], membership, sumTot, (uint32_t)iter, maxLocalIters, twoM);
+                si++;
+            }
+            double t1 = wall_time_now();
+            *cpuTime += (t1 - t0);
+
+            double td0 = wall_time_now();
+            DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+            /* 读取所有 DPU 的日志到标准输出 */
+            double td1 = wall_time_now();
+            *dpuTime += (td1 - td0);
+
+            si = 0;
+            double t2 = wall_time_now();
+            DPU_FOREACH(dpu_set, dpu) {
+                DPU_ASSERT(dpu_log_read(dpu, stdout));
+                movedAny |= pullMovedAndMembership(dpu, &shards[si], membership);
+                si++;
+            }
+            double t3 = wall_time_now();
+            *cpuTime += (t3 - t2);
+
+            printf("[Original] LocalMove iter=%d moved=%s\n", iter, movedAny ? "true" : "false");
+            iter++;
+        }
+
+        double tr0 = wall_time_now();
+        uint32_t si = 0;
+        DPU_FOREACH(dpu_set, dpu) {
+            startRefinement(dpu, &shards[si], maxRefineIters);
+            si++;
+        }
+        double tr1 = wall_time_now();
+        *cpuTime += (tr1 - tr0);
+
+        double td2 = wall_time_now();
+        DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+        double td3 = wall_time_now();
+        *dpuTime += (td3 - td2);
+
+        uint32_t *compCount = (uint32_t*)malloc(numCommunities * sizeof(uint32_t));
+        if (!compCount) break;
+        for (uint32_t i=0; i<numCommunities; ++i) compCount[i] = 1;
+        si = 0;
+        double tc0 = wall_time_now();
+        DPU_FOREACH(dpu_set, dpu) {
+            pullRefinementCounts(dpu, &shards[si], compCount);
+            si++;
+        }
+        double tc1 = wall_time_now();
+        *cpuTime += (tc1 - tc0);
+
+        int connected = allConnected(compCount, numCommunities);
+        printf("[Original] Refinement connected=%s\n", connected ? "true" : "false");
+
+        if (!connected) {
+            double tx0 = wall_time_now();
+            applyRefinementNaive(g, membership, &numCommunities, compCount);
+            for (uint32_t s=0; s<numDpus; ++s) {
+                free(shards[s].localNodes);
+                free(shards[s].localNodePtr);
+                free(shards[s].localNbr);
+                free(shards[s].activeBitmap);
+            }
+            buildShards(g, membership, numCommunities, numDpus, shards, 0);
+            if (activeGlobal) applyActiveToShards(activeGlobal, shards, numDpus);
+            computeSumTot(g, membership, numCommunities, sumTot);
+            GlobalBroadcast(dpu_set, g->n_nodes, numCommunities, membership, sumTot);
+            si = 0;
+            DPU_FOREACH(dpu_set, dpu) {
+                pushShardBroadcast(dpu, &shards[si], g->n_nodes, numCommunities, twoM);
+                si++;
+            }
+            double tx1 = wall_time_now();
+            *cpuTime += (tx1 - tx0);
+            needRepeat = 1;
+        } else {
+            needRepeat = 0;
+        }
+        free(compCount);
+    }
+
+    *pNumCommunities = numCommunities;
+    free(sumTot);
+}
+
+/* =========================================================================================
+ * 社区图层
+ * ========================================================================================= */
+static void runCommunityLayer(struct dpu_set_t dpu_set,
+                              struct Shard *shardsCG,
+                              uint32_t numDpus,
+                              graph_t *cg,
+                              uint32_t *membershipCg,
+                              uint32_t *pNumCommunitiesCg,
+                              uint64_t twoMCg,
+                              uint32_t maxLocalIters,
+                              uint32_t maxRefineIters,
+                              double *cpuTime,
+                              double *dpuTime) {
+    struct dpu_set_t dpu;
+
+    uint32_t numCommunitiesCg = *pNumCommunitiesCg;
+    uint64_t *sumTot = (uint64_t*)malloc(numCommunitiesCg * sizeof(uint64_t));
+    if (!sumTot) return;
+
+    int layerDone = 0;
+    while (!layerDone) {
+        int iter = 0;
+        int moved = 1;
+        while (moved && (maxLocalIters == 0 || iter < (int)maxLocalIters)) {
+            moved = 0;
+            double t0 = wall_time_now();
+            computeSumTot(cg, membershipCg, numCommunitiesCg, sumTot);
+            uint32_t si=0;
+            DPU_FOREACH(dpu_set, dpu) {
+                updateLocalMove(dpu, &shardsCG[si], membershipCg, sumTot, (uint32_t)iter, maxLocalIters, twoMCg);
+                si++;
+            }
+            double t1 = wall_time_now();
+            *cpuTime += (t1 - t0);
+
+            double td0 = wall_time_now();
+            DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+            double td1 = wall_time_now();
+            *dpuTime += (td1 - td0);
+
+            si=0;
+            double t2 = wall_time_now();
+            DPU_FOREACH(dpu_set, dpu) {
+                moved |= pullMovedAndMembership(dpu, &shardsCG[si], membershipCg);
+                si++;
+            }
+            double t3 = wall_time_now();
+            *cpuTime += (t3 - t2);
+            printf("[CG] LocalMove iter=%d moved=%s\n", iter, moved ? "true" : "false");
+            iter++;
+        }
+
+        uint32_t si=0;
+        double tr0 = wall_time_now();
+        DPU_FOREACH(dpu_set, dpu) {
+            startRefinement(dpu, &shardsCG[si], maxRefineIters);
+            si++;
+        }
+        double tr1 = wall_time_now();
+        *cpuTime += (tr1 - tr0);
+
+        double td2 = wall_time_now();
+        DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+        double td3 = wall_time_now();
+        *dpuTime += (td3 - td2);
+
+        uint32_t *compCount = (uint32_t*)malloc(numCommunitiesCg * sizeof(uint32_t));
+        if (!compCount) break;
+        for (uint32_t i=0; i<numCommunitiesCg; ++i) compCount[i] = 1;
+        si=0;
+        double t4 = wall_time_now();
+        DPU_FOREACH(dpu_set, dpu) {
+            pullRefinementCounts(dpu, &shardsCG[si], compCount);
+            si++;
+        }
+        double t5 = wall_time_now();
+        *cpuTime += (t5 - t4);
+
+        int connected = allConnected(compCount, numCommunitiesCg);
+        printf("[CG] Refinement connected=%s\n", connected ? "true" : "false");
+        layerDone = 1;
+        free(compCount);
+    }
+    free(sumTot);
+}
+
+/* =========================================================================================
+ * 主函数
+ * ========================================================================================= */
+#ifndef NR_DPUS
+#define NR_DPUS 64
+#endif
+
+int main(int argc, char **argv) {
+    if (argc < 7) {
+        fprintf(stderr,
+                "用法: %s <graph_file> <membership_file> <new_nodes_file|'-'> <max_local_iters> <max_refine_iters> <output_file> "
+                "[--twohop] [--no-aggregate] [--auto-new] [--new-degree=K] [--seed=SEED]\n", argv[0]);
+        return 1;
+    }
+    const char *graphFile      = argv[1];
+    const char *membershipFile = argv[2];
+    const char *newNodesFile   = argv[3];
+    uint32_t maxLocalIters     = (uint32_t)strtoul(argv[4], NULL, 10);
+    uint32_t maxRefineIters    = (uint32_t)strtoul(argv[5], NULL, 10);
+    const char *outputFile     = argv[6];
+
+    int twoHop = 0;
+    int disableAggregation = 0;
+    int autoNew = 1;
+    uint32_t newDegree = 3;
+    uint64_t seed = 123456789ULL;
+
+    for (int i=7; i<argc; ++i) {
+        if (strcmp(argv[i], "--twohop") == 0) twoHop = 1;
+        else if (strcmp(argv[i], "--no-aggregate") == 0) disableAggregation = 1;
+        else if (strcmp(argv[i], "--auto-new") == 0) autoNew = 1;
+        else if (strncmp(argv[i], "--new-degree=", 13) == 0) newDegree = (uint32_t)strtoul(argv[i]+13, NULL, 10);
+        else if (strncmp(argv[i], "--seed=", 7) == 0) seed = (uint64_t)strtoull(argv[i]+7, NULL, 10);
+    }
+
+    printf("加载图: %s\n", graphFile);
+    graph_t g;
+    if (!load_graph(graphFile, &g)) {
+        fprintf(stderr, "图加载失败\n");
+        return 1;
+    }
+    uint32_t original_n = g.n_nodes;
+    printf("原始图节点=%u 边=%u\n", g.n_nodes, g.n_edges);
+
+    uint32_t *membership = NULL;
+    uint32_t numCommunities = 0;
+    if (!load_membership_file(membershipFile, g.n_nodes, &membership, &numCommunities)) {
+        fprintf(stderr, "社区文件加载失败\n");
+        free_graph(&g);
+        return 1;
+    }
+    printf("初始社区数=%u\n", numCommunities);
+
+    uint32_t *autoNewNodes = NULL;
+    uint32_t autoNewCount = 0;
+    if (autoNew) {
+        printf("自动新增节点 10%%，随机边度=%u，seed=%" PRIu64 "\n", newDegree, seed);
+        add_random_nodes_and_edges(&g, original_n, newDegree, seed, &autoNewNodes, &autoNewCount);
+        uint32_t oldSize = original_n;
+        membership = (uint32_t*)realloc(membership, g.n_nodes * sizeof(uint32_t));
+        if (!membership) { fprintf(stderr,"内存不足\n"); free_graph(&g); return 1; }
+        for (uint32_t u = oldSize; u < g.n_nodes; ++u)
+            membership[u] = membership[u % oldSize];
+        printf("新图节点=%u 边=%u (新增节点=%u)\n", g.n_nodes, g.n_edges, autoNewCount);
+    }
+
+    uint32_t *fileNewNodes = NULL;
+    uint32_t fileNewCount = 0;
+    load_new_nodes_file(newNodesFile, g.n_nodes, &fileNewNodes, &fileNewCount);
+
+    uint32_t unionCount = autoNewCount + fileNewCount;
+    uint32_t *unionNodes = NULL;
+    if (unionCount > 0) {
+        unionNodes = (uint32_t*)malloc(unionCount * sizeof(uint32_t));
+        if (!unionNodes) { free_graph(&g); free(membership); free(autoNewNodes); free(fileNewNodes); return 1; }
+        uint32_t pos = 0;
+        for (uint32_t i=0; i<autoNewCount; ++i) unionNodes[pos++] = autoNewNodes[i];
+        for (uint32_t i=0; i<fileNewCount; ++i) unionNodes[pos++] = fileNewNodes[i];
+        int cmp_u32(const void *a, const void *b) {
+            uint32_t aa = *(const uint32_t*)a;
+            uint32_t bb = *(const uint32_t*)b;
+            return (aa > bb) - (aa < bb);
+        }
+        qsort(unionNodes, unionCount, sizeof(uint32_t), cmp_u32);
+        uint32_t w = 0;
+        for (uint32_t r=0; r<unionCount; ++r)
+            if (r==0 || unionNodes[r] != unionNodes[r-1]) unionNodes[w++] = unionNodes[r];
+        unionCount = w;
+    }
+    printf("最终新增节点数量=%u\n", unionCount);
+
+    uint64_t twoM = (uint64_t)g.n_edges * 2ULL;
+
+    uint64_t *sumTotInit = (uint64_t*)malloc(numCommunities * sizeof(uint64_t));
+    if (!sumTotInit) { free_graph(&g); free(membership); free(autoNewNodes); free(fileNewNodes); free(unionNodes); return 1; }
+    computeSumTot(&g, membership, numCommunities, sumTotInit);
+
+    if (unionCount > 0) {
+        for (uint32_t i=0; i<unionCount; ++i) {
+            uint32_t u = unionNodes[i];
+            if (u >= g.n_nodes) continue;
+            uint32_t s = g.row_ptr[u], e = g.row_ptr[u+1];
+            if (s == e) continue;
+            uint32_t deg = e - s;
+            uint32_t *commBuf = (uint32_t*)malloc(deg*sizeof(uint32_t));
+            uint32_t *cntBuf  = (uint32_t*)malloc(deg*sizeof(uint32_t));
+            if (!commBuf || !cntBuf) { free(commBuf); free(cntBuf); continue; }
+            uint32_t used = 0;
+            for (uint32_t p = s; p < e; ++p) {
+                uint32_t v = g.col_idx[p];
+                uint32_t c = membership[v];
+                uint32_t found = 0;
+                for (uint32_t k=0; k<used; ++k) {
+                    if (commBuf[k] == c) { cntBuf[k]++; found=1; break; }
+                }
+                if (!found) {
+                    commBuf[used] = c;
+                    cntBuf[used] = 1;
+                    used++;
+                }
+            }
+            uint32_t bestC = membership[u];
+            uint32_t bestCnt = 0;
+            uint64_t bestTot = (bestC < numCommunities) ? sumTotInit[bestC] : (uint64_t)-1;
+            for (uint32_t k=0; k<used; ++k) {
+                uint32_t c = commBuf[k];
+                uint32_t cnt = cntBuf[k];
+                uint64_t st = (c < numCommunities) ? sumTotInit[c] : (uint64_t)-1;
+                if (cnt > bestCnt || (cnt == bestCnt && st < bestTot)) {
+                    bestCnt = cnt;
+                    bestTot = st;
+                    bestC   = c;
+                }
+            }
+            membership[u] = bestC;
+            free(commBuf);
+            free(cntBuf);
+        }
+    }
+    free(sumTotInit);
+
+    char *activeGlobal = (char*)malloc(g.n_nodes);
+    if (!activeGlobal) { free_graph(&g); free(membership); free(autoNewNodes); free(fileNewNodes); free(unionNodes); return 1; }
+    memset(activeGlobal, 0, g.n_nodes);
+    if (unionCount == 0) {
+        memset(activeGlobal, 1, g.n_nodes);
+    } else {
+        for (uint32_t i=0;i<unionCount;++i) {
+            uint32_t u = unionNodes[i];
+            if (u >= g.n_nodes) continue;
+            activeGlobal[u] = 1;
+            uint32_t s = g.row_ptr[u], e = g.row_ptr[u+1];
+            for (uint32_t p=s;p<e;++p) {
+                uint32_t v = g.col_idx[p];
+                if (v < g.n_nodes) activeGlobal[v] = 1;
+            }
+        }
+        if (twoHop) {
+            char *tmp = (char*)malloc(g.n_nodes);
+            if (tmp) {
+                memcpy(tmp, activeGlobal, g.n_nodes);
+                for (uint32_t v=0; v<g.n_nodes; ++v) {
+                    if (!activeGlobal[v]) continue;
+                    uint32_t s = g.row_ptr[v], e = g.row_ptr[v+1];
+                    for (uint32_t p=s; p<e; ++p) {
+                        uint32_t w = g.col_idx[p];
+                        if (w < g.n_nodes) tmp[w] = 1;
+                    }
+                }
+                memcpy(activeGlobal, tmp, g.n_nodes);
+                free(tmp);
+            }
+        }
+    }
+
+    struct dpu_set_t dpu_set, dpu;
+    DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));
+    uint32_t numDpusAct = 0;
+    DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &numDpusAct));
+    DPU_ASSERT(dpu_load(dpu_set, "./bin/dpu", NULL));
+    printf("分配 DPU 数=%u\n", numDpusAct);
+
+    struct Shard *shards = (struct Shard*)calloc(numDpusAct, sizeof(struct Shard));
+    buildShards(&g, membership, numCommunities, numDpusAct, shards, 0);
+    applyActiveToShards(activeGlobal, shards, numDpusAct);
+
+    uint64_t *sumTotInit2 = (uint64_t*)malloc(numCommunities * sizeof(uint64_t));
+    if (!sumTotInit2) { free(shards); free(activeGlobal); free_graph(&g); free(membership); return 1; }
+    computeSumTot(&g, membership, numCommunities, sumTotInit2);
+    GlobalBroadcast(dpu_set, g.n_nodes, numCommunities, membership, sumTotInit2);
+    uint32_t si=0;
+    DPU_FOREACH(dpu_set, dpu) {
+        pushShardBroadcast(dpu, &shards[si], g.n_nodes, numCommunities, twoM);
+        si++;
+    }
+    free(sumTotInit2);
+
+    double cpuComputeTime = 0.0;
+    double dpuKernelTime  = 0.0;
+    double aggregationBuildTime = 0.0;
+    double cgCpuComputeTime     = 0.0;
+    double cgDpuKernelTime      = 0.0;
+
+    runOriginalIncrementalLayer(dpu_set, shards, numDpusAct,
+                                &g, membership, &numCommunities,
+                                twoM, maxLocalIters, maxRefineIters,
+                                activeGlobal,
+                                &cpuComputeTime, &dpuKernelTime);
+    printf("原始层完成: communities=%u\n", numCommunities);
+
+    graph_t cg; memset(&cg, 0, sizeof(cg));
+    uint32_t *membershipCg = NULL;
+    uint32_t numCommunitiesCg = 0;
+    uint64_t twoMCg = 0;
+    struct Shard *shardsCG = NULL;
+
+    if (!disableAggregation) {
+        double tAgg0 = wall_time_now();
+        buildCommunityGraph(&g, membership, numCommunities, &cg);
+        double tAgg1 = wall_time_now();
+        aggregationBuildTime = (tAgg1 - tAgg0);
+        printf("社区图: nodes=%u edges=%u\n", cg.n_nodes, cg.n_edges);
+
+        numCommunitiesCg = cg.n_nodes;
+        membershipCg = (uint32_t*)malloc(numCommunitiesCg * sizeof(uint32_t));
+        if (!membershipCg) {
+            printf("社区图层内存不足，跳过。\n");
+        } else {
+            for (uint32_t i=0;i<numCommunitiesCg;++i) membershipCg[i]=i;
+            twoMCg = (uint64_t)cg.n_edges * 2ULL;
+
+            shardsCG = (struct Shard*)calloc(numDpusAct, sizeof(struct Shard));
+            buildShards(&cg, membershipCg, numCommunitiesCg, numDpusAct, shardsCG, 0);
+            char *activeCg = (char*)malloc(cg.n_nodes);
+            if (activeCg) {
+                memset(activeCg, 1, cg.n_nodes);
+                applyActiveToShards(activeCg, shardsCG, numDpusAct);
+                free(activeCg);
+            }
+            uint64_t *sumTotCg = (uint64_t*)malloc(numCommunitiesCg * sizeof(uint64_t));
+            if (sumTotCg) {
+                computeSumTot(&cg, membershipCg, numCommunitiesCg, sumTotCg);
+                GlobalBroadcast(dpu_set, cg.n_nodes, numCommunitiesCg, membershipCg, sumTotCg);
+                si=0;
+                DPU_FOREACH(dpu_set, dpu) {
+                    pushShardBroadcast(dpu, &shardsCG[si], cg.n_nodes, numCommunitiesCg, twoMCg);
+                    si++;
+                }
+                free(sumTotCg);
+                runCommunityLayer(dpu_set, shardsCG, numDpusAct,
+                                  &cg, membershipCg, &numCommunitiesCg,
+                                  twoMCg, maxLocalIters, maxRefineIters,
+                                  &cgCpuComputeTime, &cgDpuKernelTime);
+            }
+        }
+    } else {
+        printf("聚合层禁用 (--no-aggregate)\n");
+    }
+
+    FILE *fout = fopen(outputFile, "w");
+    if (!fout) {
+        perror("输出文件打开失败");
+    } else {
+        fprintf(fout, "node,community\n");
+        for (uint32_t v=0; v<g.n_nodes; ++v)
+            fprintf(fout, "%u,%u\n", v, membership[v]);
+        fclose(fout);
+    }
+
+    printf("\n===== Incremental Leiden Timing Summary =====\n");
+    printf("CPU Compute (Original Layer):        %.3f ms\n", cpuComputeTime*1e3);
+    printf("DPU Kernel  (Original Layer):        %.3f ms\n", dpuKernelTime*1e3);
+    printf("CPU->DPU Transfer Total:             %.3f ms\n", g_cpu_to_dpu_time*1e3);
+    printf("DPU->CPU Transfer Total:             %.3f ms\n", g_dpu_to_cpu_time*1e3);
+    if (!disableAggregation && membershipCg) {
+        printf("Aggregation Build:                   %.3f ms\n", aggregationBuildTime*1e3);
+        printf("CPU Compute (Community Layer):       %.3f ms\n", cgCpuComputeTime*1e3);
+        printf("DPU Kernel  (Community Layer):       %.3f ms\n", cgDpuKernelTime*1e3);
+    }
+    printf("=============================================\n");
+
+    for (uint32_t s=0; s<numDpusAct; ++s) {
+        free(shards[s].localNodes);
+        free(shards[s].localNodePtr);
+        free(shards[s].localNbr);
+        free(shards[s].activeBitmap);
+    }
+    free(shards);
+
+    if (!disableAggregation && shardsCG) {
+        for (uint32_t s=0; s<numDpusAct; ++s) {
+            free(shardsCG[s].localNodes);
+            free(shardsCG[s].localNodePtr);
+            free(shardsCG[s].localNbr);
+            free(shardsCG[s].activeBitmap);
+        }
+        free(shardsCG);
+        free_graph(&cg);
+        free(membershipCg);
+    }
+
+    free(activeGlobal);
+    free(autoNewNodes);
+    free(fileNewNodes);
+    free(unionNodes);
+    free_graph(&g);
+    free(membership);
+    DPU_ASSERT(dpu_free(dpu_set));
+    return 0;
+}
